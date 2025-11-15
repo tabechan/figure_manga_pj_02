@@ -1,0 +1,164 @@
+You are an AI pair programmer. Implement the backend + frontend for a “Figure-Linked Comics” web app using Next.js (App Router) + Prisma + SQLite (upgradeable to Postgres). We already have a Figma design. Please scaffold the following deliverables and wire them together.
+
+## Tech constraints
+- Next.js 15 (App Router, TypeScript)
+- Prisma ORM with SQLite for local dev (`prisma migrate dev`)
+- Auth: Email+Password (MVP) with HttpOnly session cookies
+- API routes under /app/api/*
+- Client components in /app/*, keep server actions in appropriate places
+- UI library: Tailwind or shadcn/ui (choose one and keep it minimal)
+- Use zod for input validation
+
+## ENV
+Create `.env` and `.env.example` with:
+- DATABASE_URL="file:./dev.db"
+- JWT_SECRET="dev-secret-change-me"
+- APP_BASE_URL="http://localhost:3000"
+- CDN_BASE_URL="" # optional, leave empty for now
+- NFC_SHARED_KEY="" # reserved for future SUN/CMAC validation
+
+## Data model (Prisma)
+- User: id, email (unique), password_hash, createdAt
+- Figure: id, title, seriesTitle, tagUid (unique), status ("unclaimed"|"pre_bound"|"claimed"), ownerUserId (nullable), createdAt
+- PreBind: id, orderId, userId, figureId, expiresAt
+- License: id, figureId, ownerUserId, createdAt
+- ReadRights: figureId (unique), activeUserId, state ("owner"|"loaned"), loanToUserId (nullable), loanStart (nullable), loanEnd (nullable), updatedAt
+- ContentAsset: id, figureId, volumeNo, title, coverUrl, fileUrl, owned (boolean per license is derived, do not store here)
+- LoanTicket: id, figureId, issuedByUserId, token (unique), urlSlug (unique), expiresAt, consumedAt (nullable)
+- Product: id, title, price, imageUrl, badges (json)
+- Cart: id, userId
+- CartItem: id, cartId, productId, qty
+- Event: id, title, date, location, thumbnailUrl, body
+- News: id, title, date, thumbnailUrl, body
+- AuditLog: id, userId (nullable), figureId (nullable), action, meta(json), createdAt
+
+## Routes & pages
+1) /login (Post-scan landing)
+   - Shows figure pop-up animation (placeholder) and message:
+     "{username}さんの仲間に『{seriesTitle}』が加わります！"
+   - Email/Password form -> POST /api/auth/login
+   - Link: Sign up, Forgot password (stubs ok)
+2) / (TOP)
+   - Figure hero area + buttons:
+     * 作品を読む (primary) -> /read
+     * 作品貸出 -> /loan
+     * グッズ -> /goods
+     * イベント -> /events
+     * ニュース (+ latest 2 headlines) -> /news
+     * LINEで最新情報を知る -> external link
+     * 作者の他の作品へ -> /works
+3) /read
+   - Volume selection: list ContentAsset per figure
+   - Owned -> “読む” (opens /read/[volumeNo])
+   - Not owned -> grayed card + “購入する” (stub)
+4) /read/[volumeNo]
+   - Manga viewer: image/page list with prev/next, zoom, progress
+   - Shows subtle watermark (userId + timestamp)
+   - Uses short-lived tokens from /api/read/start
+5) /loan
+   - Explain: during loan, owner cannot read
+   - Inputs: loan days (1–30), checkbox agree to terms
+   - Action: "貸出用QRコードを発行" -> POST /api/loan/start
+   - Show QR (generated from unique URL), “URLをコピー”
+   - Show status pill with until date
+6) /goods, /goods/[id], /cart, /checkout
+   - Basic e-commerce flow with add-to-cart -> “購入に進む”
+7) /events and /events/[id], /news and /news/[id]
+8) /works (作品一覧)
+   - Tabs: 所有作品 / まだ持っていない作品
+   - Sections for 未所持: あなたへのおすすめ / 新刊 / 人気の漫画 + search + filters
+9) Hamburger menu (right) -> Drawer: 作品一覧 / アカウント / プライバシーポリシー / 利用規約
+
+## API contracts (minimal)
+
+### Auth
+POST /api/auth/login
+- body: { email, password }
+- return: set HttpOnly cookie, 200 {ok:true}
+POST /api/auth/logout
+- clear cookie
+
+### Scan/Claim (stubs now)
+POST /api/scan
+- body: { figureId, medium, nfcProof? }
+- return: {status:"ok", claimable:true|false}
+POST /api/claim
+- auth required; body: { figureId, nfcProof, idempotencyKey }
+- transactional checks: pre-bound to this user, verify (if implemented), set owner, create License, init ReadRights(state="owner")
+- return: {status:"claimed"}
+
+### Reading
+POST /api/read/start
+- auth required; body: { figureId, volumeNo }
+- server verifies: user has active right (owner or loaned within window)
+- returns: { jwt, signedParts: [{page, url}], sessionId }
+POST /api/read/heartbeat
+- body: { sessionId } -> extend short-lived token
+POST /api/read/stop
+- invalidate session
+
+### Loan
+POST /api/loan/start
+- auth required; body: { figureId, days, agree }
+- atomically set ReadRights(state="loaned", loanToUserId=null, window)
+- create LoanTicket { token, urlSlug, expiresAt }
+- return: { qrSvgDataUrl, uniqueUrl }
+POST /api/loan/activate
+- auth required by borrower; body: { token or urlSlug }
+- set ReadRights.activeUserId = borrower.id
+POST /api/loan/end
+- owner or system; body: { figureId }
+- revert ReadRights to owner, revoke borrower sessions
+
+### Goods/Cart
+GET /api/products
+GET /api/products/[id]
+POST /api/cart/add
+POST /api/cart/remove
+POST /api/checkout/init (stub)
+
+### News/Events
+GET /api/news?limit=*
+GET /api/news/[id]
+GET /api/events
+GET /api/events/[id]
+
+### Audit log helper
+POST /api/audit
+- body: { action, meta }
+
+## Security & sessions
+- Session cookie: HttpOnly, SameSite=Lax, Secure in prod
+- CSRF: apply to state-changing requests; or rely on double submit (token in cookie + header)
+- Rate limit login and claim endpoints
+- Only one active reading session per ReadRights (invalidate previous)
+
+## Manga viewer (MVP)
+- For now, treat pages as image URLs in ContentAsset.fileUrl array
+- Render with virtualized list or page-by-page fetch
+- Controls: prev/next, pinch zoom, slider; hide chrome on tap
+- Add faint watermark (userId, time) on the canvas layer
+
+## NFC/QR (MVP)
+- Provide a page /scan to accept query params like ?figureId=...&proof=...
+- QR: generate for loan with unique slug
+- NFC: leave hook parameter nfcProof for future SUN/CMAC implementation
+
+## Dev tasks (step-by-step)
+1. Init Next.js + Prisma + Tailwind/shadcn, create schema, run `prisma migrate dev`
+2. Implement Auth (login/logout), session middleware
+3. Seed: create a demo user, one figure with pre-bound, 3 volumes (1 owned, 2 locked), some products/news/events
+4. Implement /api/claim (transaction + idempotency)
+5. Implement /api/read/start with JWT + single-session guard (in-memory map or DB table), add /read UI
+6. Implement /api/loan/start (/activate, /end) + QR generation (SVG)
+7. Implement goods/cart basic flow
+8. Wire TOP: load latest 2 news, link-out LINE, hero figure, buttons
+9. Add audit logs to critical endpoints
+10. Add rate limits & simple CSRF protection
+11. Provide .env.example and README with run instructions
+
+## Nice to have (scoped out)
+- Passkey (WebAuthn) for re-auth before claim
+- DRM-like chunk encryption & KMS
+- NFC SUN/CMAC verification
+- CDN signed URLs
